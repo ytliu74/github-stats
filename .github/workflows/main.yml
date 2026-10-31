@@ -2,7 +2,10 @@ name: Generate Stats Images
 
 on:
   push:
-    branches: [ master ]
+    branches:
+      - master
+    paths-ignore:
+      - 'generated/**'
   schedule:
     - cron: "5 0 * * *"
   workflow_dispatch:
@@ -10,46 +13,70 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: github-stats-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash -euxo pipefail {0}
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-
+    runs-on: ubuntu-24.04
     steps:
-    # Check out repository under $GITHUB_WORKSPACE, so the job can access it
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
 
-    # Run using Python 3.8 for consistency and aiohttp
-    - name: Set up Python 3.8
-      uses: actions/setup-python@v4
+    - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29  # v2 tag
       with:
-        python-version: '3.8'
-        architecture: 'x64'
-        cache: 'pip'
+        version: 0.16.0
 
-    # Install dependencies with `pip`
-    - name: Install requirements
+    - name: Build
       run: |
-        python3 -m pip install --upgrade pip setuptools wheel
-        python3 -m pip install -r requirements.txt
+        zig build
 
-    # Generate all statistics images
+    - name: Test
+      run: |
+        zig build test
+
+    - name: Verify token email access
+      run: gh api user/emails --silent
+      env:
+        GH_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+
     - name: Generate images
       run: |
-        python3 --version
-        python3 generate_images.py
+        mkdir -p generated
+        ./zig-out/bin/github-stats \
+          --overview-output-file generated/overview.svg \
+          --languages-output-file generated/languages.svg
       env:
         ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        EXCLUDED: ${{ secrets.EXCLUDED }}
-        EXCLUDED_LANGS: ${{ secrets.EXCLUDED_LANGS }}
-        EXCLUDE_FORKED_REPOS: true
+        EXCLUDE_REPOS: ${{ secrets.EXCLUDE_REPOS || secrets.EXCLUDED }}
+        EXCLUDE_LANGS: ${{ secrets.EXCLUDE_LANGS || secrets.EXCLUDED_LANGS }}
+        EXCLUDE_FORKED_REPOS: "true"
+        EXCLUDE_PRIVATE: "false"
+        SILENT: "true"
+        # TODO: Remove this when they get their API working again
+        # https://github.com/orgs/community/discussions/192970
+        MAX_RETRIES: 5
 
-    # Commit all changed files to the repository
-    - name: Commit to the repo
+    - name: Validate generated images
       run: |
-        git config --global user.name "jstrieb/github-stats"
-        git config --global user.email "github-stats[bot]@jstrieb.github.io"
-        git add .
-        # Force the build to succeed, even if no files were changed
-        git commit -m 'Update generated files' || true
-        git push
+        python3 - <<'PY'
+        import xml.etree.ElementTree as ET
+        for path in ['generated/overview.svg', 'generated/languages.svg']:
+            root = ET.parse(path).getroot()
+            assert root.tag == '{http://www.w3.org/2000/svg}svg', path
+        PY
+
+    - name: Commit to the repo
+      if: github.ref == 'refs/heads/master'
+      run: |
+        git config user.name "jstrieb/github-stats"
+        git config user.email "github-stats[bot]@jstrieb.github.io"
+        git add generated/overview.svg generated/languages.svg
+        if ! git diff --cached --quiet; then
+          git commit -m 'Update generated files'
+          git push origin HEAD:master
+        fi
